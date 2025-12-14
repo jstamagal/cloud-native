@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Create a distrobox/toolbox from a profile file and optionally preinstall packages.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+PROFILE=""
+NAME_OVERRIDE=""
+IMAGE_OVERRIDE=""
+VOLUMES=()
+YES=0
+
+usage() {
+  cat <<EOF
+dbx-create <toolboxes/profile.ini> [--name NAME] [--image IMAGE] [--volume SRC:DST[:opt]] [--yes]
+Profile keys:
+  NAME=           default container name
+  IMAGE=          container image (docker/podman syntax)
+  INIT=0|1        pass --init to distrobox
+  EXTRA_ARGS=     extra flags to distrobox create
+  PREINSTALL=     space separated packages to install after creation
+EOF
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage;;
+    --name) NAME_OVERRIDE=$2; shift 2;;
+    --image) IMAGE_OVERRIDE=$2; shift 2;;
+    --volume) VOLUMES+=("$2"); shift 2;;
+    --yes|-y) YES=1; shift;;
+    *) if [ -z "$PROFILE" ]; then PROFILE=$1; shift; else usage; fi;;
+  esac
+done
+
+[ -n "$PROFILE" ] || usage
+[ -f "$PROFILE" ] || die "profile not found: $PROFILE"
+
+ensure_commands distrobox podman
+
+# shellcheck disable=SC1090
+. "$PROFILE"
+
+NAME=${NAME_OVERRIDE:-${NAME:-}}
+IMAGE=${IMAGE_OVERRIDE:-${IMAGE:-}}
+INIT=${INIT:-1}
+EXTRA_ARGS=${EXTRA_ARGS:-}
+PREINSTALL=${PREINSTALL:-}
+
+[ -n "$NAME" ] || die "profile missing NAME"
+[ -n "$IMAGE" ] || die "profile missing IMAGE"
+
+if podman container exists "$NAME"; then
+  die "container $NAME already exists"
+fi
+
+args=(create --name "$NAME" --image "$IMAGE")
+[ "$INIT" -eq 1 ] && args+=(--init)
+[ -n "$EXTRA_ARGS" ] && args+=($EXTRA_ARGS)
+for v in "${VOLUMES[@]}"; do args+=(--volume "$v"); done
+
+log "distrobox ${args[*]}"
+if [ "$YES" -eq 1 ]; then
+  distrobox "${args[@]}"
+else
+  distrobox "${args[@]}" </dev/tty
+fi
+
+if [ -n "$PREINSTALL" ]; then
+  log "preinstalling: $PREINSTALL"
+  distrobox enter --name "$NAME" -- /bin/sh -s $PREINSTALL <<'EOF'
+set -e
+pm=""
+for c in dnf microdnf yum apt-get apt zypper pacman apk xbps-install; do
+  command -v "$c" >/dev/null 2>&1 && { pm=$c; break; }
+done
+[ -n "$pm" ] || { echo "no supported package manager found" >&2; exit 1; }
+case "$pm" in
+  dnf|microdnf|yum) sudo -n "$pm" -y install "$@" 2>/dev/null || "$pm" -y install "$@";;
+  apt-get|apt) sudo -n apt-get update >/dev/null 2>&1 || apt-get update;
+               sudo -n apt-get install -y "$@" 2>/dev/null || apt-get install -y "$@";;
+  zypper) sudo -n zypper --non-interactive install "$@" 2>/dev/null || zypper --non-interactive install "$@";;
+  pacman) sudo -n pacman -Syu --noconfirm "$@" 2>/dev/null || pacman -Syu --noconfirm "$@";;
+  apk) sudo -n apk add "$@" 2>/dev/null || apk add "$@";;
+  xbps-install) sudo -n xbps-install -Sy "$@" 2>/dev/null || xbps-install -Sy "$@";;
+  *) echo "unsupported package manager: $pm" >&2; exit 1;;
+esac
+EOF
+fi
+
+log "container $NAME ready"

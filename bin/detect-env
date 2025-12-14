@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Lightweight environment detection for host vs container vs distrobox/toolbox.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+is_container=0
+reason=""
+
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+  is_container=1
+  reason="containerenv"
+elif have systemd-detect-virt && systemd-detect-virt --quiet --container; then
+  is_container=1
+  reason="systemd-detect-virt"
+elif grep -q "docker\|podman" /proc/1/cgroup 2>/dev/null; then
+  is_container=1
+  reason="cgroup"
+fi
+
+box_name=${DISTROBOX_NAME:-${TOOLBOX_NAME:-unknown}}
+os_id=$(detect_os_id)
+os_pretty=$(detect_pretty_name)
+
+cat <<EOF
+is_container=$is_container
+detected_by=$reason
+distrobox_name=$box_name
+os_id=$os_id
+os_pretty=$os_pretty
+EOF

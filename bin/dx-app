@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Install packages into a source distrobox/toolbox and export launchers into a desktop distrobox.
+#
+# Typical workflow (defaults match the author's setup):
+#   dx-app install-export firefox vscode
+#     installs inside userland box and drops .desktop + wrappers into desktop box.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+SOURCE_BOX=${DX_SOURCE_BOX:-userland}
+TARGET_BOX=${DX_DESKTOP_BOX:-desktop}
+TARGET_USER=${DX_DESKTOP_USER:-${USER:-root}}
+AUTO_START=1
+
+usage() {
+  cat <<EOF
+dx-app install-export [--from BOX] [--to BOX] [--user USER] [--no-start] item[:AppId]...
+dx-app install        [--from BOX] pkg...
+dx-app export         [--from BOX] [--to BOX] [--user USER] [--no-start] AppId...
+
+Defaults: --from $SOURCE_BOX  --to $TARGET_BOX  --user $TARGET_USER
+item syntax:
+  pkg           install pkg and export the same app id
+  pkg:AppId     install pkg, export AppId
+  :AppId        export AppId without installing
+EOF
+  exit 1
+}
+
+ensure_containers() {
+  ensure_commands podman distrobox mktemp
+  for box in "$SOURCE_BOX" "$TARGET_BOX"; do
+    podman container exists "$box" || die "container '$box' not found (create it with distrobox create --name $box ...)"
+  done
+}
+
+ensure_running() {
+  local box=$1
+  local running
+  running=$(podman inspect --format '{{.State.Running}}' "$box" 2>/dev/null || echo false)
+  if [ "$running" != "true" ] && [ "$AUTO_START" -eq 1 ]; then
+    log "starting container $box"
+    podman start "$box" >/dev/null
+  fi
+}
+
+install_pkgs() {
+  local box=$1; shift
+  [ "$#" -gt 0 ] || return 0
+  log "[${box}] installing: $*"
+  distrobox enter --name "$box" -- /bin/sh -s "$@" <<'EOF'
+set -e
+pkgs="$*"
+pm=""
+for c in dnf microdnf yum apt-get apt zypper pacman apk xbps-install; do
+  command -v "$c" >/dev/null 2>&1 && { pm=$c; break; }
+done
+[ -n "$pm" ] || { echo "no supported package manager found" >&2; exit 1; }
+case "$pm" in
+  dnf|microdnf|yum) sudo -n "$pm" -y install "$@" 2>/dev/null || "$pm" -y install "$@";;
+  apt-get|apt) sudo -n apt-get update >/dev/null 2>&1 || apt-get update;
+               sudo -n apt-get install -y "$@" 2>/dev/null || apt-get install -y "$@";;
+  zypper) sudo -n zypper --non-interactive install "$@" 2>/dev/null || zypper --non-interactive install "$@";;
+  pacman) sudo -n pacman -Syu --noconfirm "$@" 2>/dev/null || pacman -Syu --noconfirm "$@";;
+  apk) sudo -n apk add "$@" 2>/dev/null || apk add "$@";;
+  xbps-install) sudo -n xbps-install -Sy "$@" 2>/dev/null || xbps-install -Sy "$@";;
+  *) echo "unsupported package manager: $pm" >&2; exit 1;;
+esac
+EOF
+}
+
+export_app() {
+  local app=$1
+  ensure_running "$TARGET_BOX"
+  ensure_running "$SOURCE_BOX"
+
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/dx-export.XXXXXX")
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  # Run export inside source box but drop artifacts into temp dir on the host.
+  distrobox enter --name "$SOURCE_BOX" -- env \
+    HOME="$tmpdir" \
+    XDG_DATA_HOME="$tmpdir/.local/share" \
+    XDG_CONFIG_HOME="$tmpdir/.config" \
+    DBX_BIN_DIR="$tmpdir/.local/bin" \
+    distrobox-export --app "$app" --export-label none >/dev/null
+
+  desktop_dir="$tmpdir/.local/share/applications"
+  bin_dir="$tmpdir/.local/bin"
+
+  [ -d "$desktop_dir" ] || die "export failed: no desktop files produced for $app"
+
+  podman exec "$TARGET_BOX" sh -lc "mkdir -p /home/$TARGET_USER/.local/share/applications /home/$TARGET_USER/.local/bin"
+  podman cp "$desktop_dir/." "$TARGET_BOX:/home/$TARGET_USER/.local/share/applications/"
+  if [ -d "$bin_dir" ] && [ "$(ls -A "$bin_dir")" ]; then
+    podman cp "$bin_dir/." "$TARGET_BOX:/home/$TARGET_USER/.local/bin/"
+  fi
+  podman exec "$TARGET_BOX" sh -lc "chown -R $TARGET_USER:$TARGET_USER /home/$TARGET_USER/.local/share/applications /home/$TARGET_USER/.local/bin"
+
+  log "exported $app into $TARGET_BOX as $TARGET_USER"
+}
+
+cmd_install() {
+  [ "$#" -gt 0 ] || usage
+  ensure_containers
+  install_pkgs "$SOURCE_BOX" "$@"
+}
+
+cmd_export() {
+  [ "$#" -gt 0 ] || usage
+  ensure_containers
+  for app in "$@"; do
+    export_app "$app"
+  done
+}
+
+cmd_install_export() {
+  [ "$#" -gt 0 ] || usage
+  ensure_containers
+  for item in "$@"; do
+    pkg=${item%%:*}
+    app=${item#*:}
+    [ "$item" = "$pkg" ] && app=$pkg  # no colon, same name
+    if [ -n "$pkg" ]; then
+      install_pkgs "$SOURCE_BOX" "$pkg"
+    fi
+    [ -z "$app" ] || export_app "$app"
+  done
+}
+
+# -------- argument parsing --------
+
+cmd=""
+args=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    install|export|install-export) cmd=$1; shift; break;;
+    --from) SOURCE_BOX=$2; shift 2;;
+    --to) TARGET_BOX=$2; shift 2;;
+    --user) TARGET_USER=$2; shift 2;;
+    --no-start) AUTO_START=0; shift;;
+    -h|--help) usage;;
+    *) usage;;
+  esac
+done
+
+[ -n "$cmd" ] || usage
+args=("$@")
+
+case "$cmd" in
+  install) cmd_install "${args[@]}";;
+  export) cmd_export "${args[@]}";;
+  install-export) cmd_install_export "${args[@]}";;
+  *) usage;;
+esac

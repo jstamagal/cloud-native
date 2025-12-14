@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Generate a user-level quadlet (.container) for podman and optionally enable it.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+NAME=""
+IMAGE=""
+PORTS=()
+VOLUMES=()
+ENVS=()
+LABELS=()
+RESTART="on-failure"
+NETWORK=""
+AUTOSTART=0
+USERNS="keep-id"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd"
+
+usage() {
+  cat <<EOF
+quadlet-new <name> --image IMAGE [options]
+  --port host:ctr[/proto]   map port (can be repeated)
+  --volume src:dest[:opt]   bind mount (can be repeated)
+  --env KEY=VAL             environment variable (repeat)
+  --label KEY=VAL           container label (repeat)
+  --network NET             attach to existing podman network
+  --restart POLICY          default on-failure
+  --userns MODE             default keep-id
+  --autostart               enable + start user service after writing
+  --unit-dir DIR            defaults to ~/.config/containers/systemd
+EOF
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage;;
+    --image) IMAGE=$2; shift 2;;
+    --port) PORTS+=("$2"); shift 2;;
+    --volume) VOLUMES+=("$2"); shift 2;;
+    --env) ENVS+=("$2"); shift 2;;
+    --label) LABELS+=("$2"); shift 2;;
+    --network) NETWORK=$2; shift 2;;
+    --restart) RESTART=$2; shift 2;;
+    --userns) USERNS=$2; shift 2;;
+    --autostart) AUTOSTART=1; shift;;
+    --unit-dir) UNIT_DIR=$2; shift 2;;
+    *) if [ -z "$NAME" ]; then NAME=$1; shift; else usage; fi;;
+  esac
+done
+
+[ -n "$NAME" ] || usage
+[ -n "$IMAGE" ] || die "missing --image"
+
+ensure_commands podman systemctl
+
+mkdir -p "$UNIT_DIR"
+unit_path="$UNIT_DIR/$NAME.container"
+
+{
+  echo "[Unit]"
+  echo "Description=$NAME container"
+  echo "Wants=network-online.target"
+  echo "After=network-online.target"
+  echo
+  echo "[Container]"
+  echo "Image=$IMAGE"
+  echo "ContainerName=$NAME"
+  echo "UserNS=$USERNS"
+  echo "AutoUpdate=registry"
+  echo "Restart=$RESTART"
+  for p in "${PORTS[@]}"; do echo "PublishPort=$p"; done
+  for v in "${VOLUMES[@]}"; do echo "Volume=$v"; done
+  for e in "${ENVS[@]}"; do echo "Environment=$e"; done
+  for l in "${LABELS[@]}"; do echo "Label=$l"; done
+  [ -n "$NETWORK" ] && echo "Network=$NETWORK"
+  echo
+  echo "[Install]"
+  echo "WantedBy=default.target"
+} >"$unit_path"
+
+log "wrote $unit_path"
+
+systemctl --user daemon-reload
+if [ "$AUTOSTART" -eq 1 ]; then
+  systemctl --user enable --now "$NAME".service
+  log "enabled and started $NAME.service"
+else
+  log "enable with: systemctl --user enable --now $NAME.service"
+fi
