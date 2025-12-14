@@ -72,6 +72,8 @@ QEMU helpers (when --run-qemu is set):
 Notes:
   - This does NOT copy private SSH keys.
   - Building the raw image requires root (loop device + coreos-installer).
+  - If the `coreos-installer` binary is not installed, we transparently fall back to
+    the official container image via podman (requires privileged podman).
 EOF
   exit 1
 }
@@ -264,7 +266,7 @@ EOF
 build_raw_image() {
   img="$OUT_DIR/fcos-usb.img"
 
-  ensure_commands coreos-installer losetup truncate
+  ensure_commands losetup truncate
 
   if [ "$(id -u)" -ne 0 ] && ! have sudo; then
     die "building a raw image requires root; re-run as root or install sudo"
@@ -276,12 +278,27 @@ build_raw_image() {
   loopdev=$(sudo_maybe losetup --find --show "$img")
   trap 'sudo_maybe losetup -d "$loopdev" >/dev/null 2>&1 || true' RETURN
 
-  log "installing FCOS to $loopdev (stream=$STREAM arch=$ARCH platform=$PLATFORM)"
-  sudo_maybe coreos-installer install "$loopdev" \
-    --stream "$STREAM" \
-    --architecture "$ARCH" \
-    --platform "$PLATFORM" \
-    --ignition-file "$OUT_DIR/ignition.json"
+  if have coreos-installer; then
+    log "installing FCOS to $loopdev (stream=$STREAM arch=$ARCH platform=$PLATFORM) via local coreos-installer"
+    sudo_maybe coreos-installer install "$loopdev" \
+      --stream "$STREAM" \
+      --architecture "$ARCH" \
+      --platform "$PLATFORM" \
+      --ignition-file "$OUT_DIR/ignition.json"
+  else
+    ensure_commands podman
+    log "coreos-installer not found; using containerized installer (pulls quay.io/coreos/coreos-installer:release)"
+    sudo_maybe podman run --pull=always --privileged --rm \
+      -v /dev:/dev \
+      -v /run/udev:/run/udev \
+      -v "$OUT_DIR":/data:z \
+      quay.io/coreos/coreos-installer:release \
+      install "$loopdev" \
+        --stream "$STREAM" \
+        --architecture "$ARCH" \
+        --platform "$PLATFORM" \
+        --ignition-file /data/ignition.json
+  fi
 
   sudo_maybe sync
   sudo_maybe losetup -d "$loopdev"
