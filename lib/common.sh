@@ -53,6 +53,45 @@ detect_pretty_name() {
   fi
 }
 
+detect_distro_name() {
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf "%s" "${ID:-${NAME:-unknown}}"
+  else
+    printf "unknown"
+  fi
+}
+
+pick_hostname() {
+  # Pick a fun hostname codename. Optionally accepts a prefix for namespacing.
+  prefix=${1:-}
+  names=(
+    thunderhawk nightjar starling kestrel osprey sparrow
+    aurora zenith horizon ember quasar nebula
+    cinder drift summit echo ripple vector nexus
+    helix quill atlas rover comet delta sigma
+  )
+  # Seed randomness from PID/time; avoid external deps.
+  idx=$(( ( ( $$ + $(date +%s) ) ) % ${#names[@]} ))
+  base=${names[$idx]}
+  if [ -n "$prefix" ]; then
+    printf "%s-%s" "$prefix" "$base"
+  else
+    printf "%s" "$base"
+  fi
+}
+
+pick_box_name() {
+  # Usage: pick_box_name [profile|distro] [hostname]
+  # If hostname is empty, pick one; if profile empty, use detected distro id.
+  profile=${1:-}
+  host=${2:-}
+  [ -n "$profile" ] || profile=$(detect_distro_name)
+  [ -n "$host" ] || host=$(pick_hostname)
+  printf "%s-%s" "$profile" "$host"
+}
+
 detect_pkg_manager() {
   for pm in dnf microdnf yum apt-get apt zypper pacman apk xbps-install; do
     if have "$pm"; then
@@ -322,5 +361,27 @@ require_rootless_podman() {
   if ! podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q true; then
     die "podman rootless is required (run as your user; check subuids/subgids)"
   fi
+}
+
+random_hostname() {
+  # Generate a random hostname from a curated list.
+  # Usage: hostname=$(random_hostname)
+  local names=(
+    thunderhawk milliways battlestar shadowfax nostromo serenity
+    nebuchadnezzar rocinante deathstar tardis normandy pillarofautumn
+    eventhorizon blackpearl highwind ragnarok valhalla asgard midgard
+    olympus stormbreaker mjolnir excalibur anduril orcrist glamdring
+    aegis leviathan behemoth colossus titan phantom spectre wraith
+    reaper viper raptor basilisk chimera hydra kraken fenrir cerberus
+    achilles odysseus icarus daedalus prometheus atlas helios hyperion
+    pegasus phoenix griffin manticore wyvern dragonfire ironclad sentinel
+    citadel fortress bastion rampart bulwark guardian protector avenger
+    voyager endeavor discovery enterprise intrepid defiant reliant
+    constellation polaris sirius arcturus vega orion andromeda cassiopeia
+    nebula quasar pulsar supernova stardust comet meteor asteroid
+    tempest cyclone typhoon hurricane blizzard avalanche inferno
+    eclipse horizon zenith apex nexus vertex core matrix grid
+  )
+  printf "%s" "${names[$RANDOM % ${#names[@]}]}"
 }
 

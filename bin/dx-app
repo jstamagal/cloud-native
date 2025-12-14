@@ -20,6 +20,7 @@ usage() {
 dx-app install-export [--from BOX] [--to BOX] [--user USER] [--no-start] item[:AppId]...
 dx-app install        [--from BOX] pkg...
 dx-app export         [--from BOX] [--to BOX] [--user USER] [--no-start] AppId...
+dx-app status         [--from BOX] [--to BOX] [--user USER]
 
 Defaults: --from $SOURCE_BOX  --to $TARGET_BOX  --user $TARGET_USER
 item syntax:
@@ -99,6 +100,14 @@ cmd_export() {
   done
 }
 
+cmd_status() {
+  ensure_containers
+  ensure_running "$TARGET_BOX"
+  ensure_running "$SOURCE_BOX"
+  log "status: source=$SOURCE_BOX target=$TARGET_BOX user=$TARGET_USER"
+  podman exec "$TARGET_BOX" sh -lc "set -e; ddir=\"/home/$TARGET_USER/.local/share/applications\"; bdir=\"/home/$TARGET_USER/.local/bin\"; echo \"[applications]\"; [ -d \"$ddir\" ] && ls -1 \"$ddir\" || echo '(none)'; echo \"[wrappers]\"; [ -d \"$bdir\" ] && ls -1 \"$bdir\" || echo '(none)'"
+}
+
 cmd_install_export() {
   [ "$#" -gt 0 ] || usage
   ensure_containers
@@ -120,7 +129,7 @@ args=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    install|export|install-export) cmd=$1; shift; break;;
+    install|export|install-export|status) cmd=$1; shift; break;;
     --from) SOURCE_BOX=$2; shift 2;;
     --to) TARGET_BOX=$2; shift 2;;
     --user) TARGET_USER=$2; shift 2;;
@@ -137,5 +146,6 @@ case "$cmd" in
   install) cmd_install "${args[@]}";;
   export) cmd_export "${args[@]}";;
   install-export) cmd_install_export "${args[@]}";;
+  status) cmd_status;;
   *) usage;;
 esac

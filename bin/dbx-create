@@ -13,10 +13,12 @@ VOLUMES=()
 YES=0
 GUI_OVERRIDE=""
 SYSTEM_BUS_OVERRIDE=""
+AUTO_NAME=0
+HOSTNAME_OVERRIDE=""
 
 usage() {
   cat <<EOF
-dbx-create <toolboxes/profile.ini> [--name NAME] [--image IMAGE] [--volume SRC:DST[:opt]] [--yes] [--gui] [--system-bus]
+dbx-create <toolboxes/profile.ini> [--name NAME] [--image IMAGE] [--volume SRC:DST[:opt]] [--yes] [--gui] [--system-bus] [--auto-name]
 Profile keys:
   NAME=           default container name
   IMAGE=          container image (docker/podman syntax)
@@ -26,6 +28,10 @@ Profile keys:
   PREINSTALL=     space separated packages to install after creation
   GUI=0|1         if 1, add common GUI passthrough devices (/dev/dri, /dev/input)
   GUI_SYSTEM_BUS=0|1 if 1, bind-mount /run/dbus/system_bus_socket (host must provide it)
+
+Flags:
+  --auto-name     generate name as <profile|distro>-<hostname>
+  --hostname NAME|random  set hostname passed to distrobox; 'random' picks a codename
 EOF
   exit 1
 }
@@ -39,6 +45,8 @@ while [ "$#" -gt 0 ]; do
     --yes|-y) YES=1; shift;;
     --gui) GUI_OVERRIDE=1; shift;;
     --system-bus) SYSTEM_BUS_OVERRIDE=1; shift;;
+    --auto-name) AUTO_NAME=1; shift;;
+    --hostname) HOSTNAME_OVERRIDE=$2; shift 2;;
     *) if [ -z "$PROFILE" ]; then PROFILE=$1; shift; else usage; fi;;
   esac
 done
@@ -60,8 +68,19 @@ PREINSTALL=${PREINSTALL:-}
 GUI=${GUI_OVERRIDE:-${GUI:-0}}
 GUI_SYSTEM_BUS=${SYSTEM_BUS_OVERRIDE:-${GUI_SYSTEM_BUS:-0}}
 
-[ -n "$NAME" ] || die "profile missing NAME"
 [ -n "$IMAGE" ] || die "profile missing IMAGE"
+
+if [ "$HOSTNAME_OVERRIDE" = "random" ]; then
+  HOSTNAME_OVERRIDE=$(pick_hostname)
+fi
+
+if [ "$AUTO_NAME" -eq 1 ]; then
+  prof_basename=$(basename "${PROFILE}" .ini)
+  NAME=$(pick_box_name "$prof_basename" "$HOSTNAME_OVERRIDE")
+  log "auto-generated name: $NAME"
+fi
+
+[ -n "$NAME" ] || die "profile missing NAME (or use --auto-name)"
 
 if podman container exists "$NAME"; then
   die "container $NAME already exists"
@@ -70,6 +89,7 @@ fi
 args=(create --name "$NAME" --image "$IMAGE")
 [ "$INIT" -eq 1 ] && args+=(--init)
 [ -n "$EXTRA_ARGS" ] && args+=($EXTRA_ARGS)
+[ -n "$HOSTNAME_OVERRIDE" ] && args+=(--hostname "$HOSTNAME_OVERRIDE")
 
 if [ "$GUI" -eq 1 ] 2>/dev/null; then
   # Common GPU + input passthrough for Wayland compositors.

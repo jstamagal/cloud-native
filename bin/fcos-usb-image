@@ -7,7 +7,7 @@
 
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../lib/common.sh
+# shellcheck source=../lib/common.sh disable=SC1091
 . "$SCRIPT_DIR/../lib/common.sh"
 
 OUT_DIR=""
@@ -110,6 +110,13 @@ b64_file() {
   fi
 }
 
+escape_for_dq() {
+  # Escape a string for safe use inside double quotes.
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf "%s" "$s"
+}
+
 write_ignition() {
   mkdir -p "$OUT_DIR"
 
@@ -129,15 +136,13 @@ write_ignition() {
     fi
   done
 
-  bootstrap_script=$(cat <<EOF
+  bootstrap_template=$(cat <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-user="${USERNAME}"
-repo="${REPO_URL}"
-ref="${REPO_REF}"
-marker="/var/home/${USERNAME}/.cloud-native-bootstrapped"
-
-target_dir="/var/home/${USERNAME}/cloud-native"
+user="__USERNAME__"
+repo="__REPO_URL__"
+ref="__REPO_REF__"
+marker="/var/home/${user}/.cloud-native-bootstrapped"
 
 [ -e "$marker" ] && exit 0
 
@@ -151,15 +156,22 @@ fi
 # Clone using a container so we don't need git on the host.
 # Keep it simple: install git in the container, clone, checkout ref.
 podman run --rm \
-  -v "/var/home/${USERNAME}:/target" \
+  -v "/var/home/${user}:/target" \
   docker.io/library/fedora:41 \
-  bash -lc "dnf -y install git ca-certificates >/dev/null && rm -rf /target/cloud-native && git clone --depth 1 --branch '$ref' '$repo' /target/cloud-native"
+  bash -lc "dnf -y install git ca-certificates >/dev/null && rm -rf /target/cloud-native && git clone --depth 1 --branch \"$ref\" \"$repo\" /target/cloud-native"
 
-chown -R "${USERNAME}:${USERNAME}" "/var/home/${USERNAME}/cloud-native" || true
+chown -R "${user}:${user}" "/var/home/${user}/cloud-native" || true
 
 touch "$marker"
 EOF
 )
+
+  esc_user=$(escape_for_dq "$USERNAME")
+  esc_repo=$(escape_for_dq "$REPO_URL")
+  esc_ref=$(escape_for_dq "$REPO_REF")
+  bootstrap_script=${bootstrap_template//__USERNAME__/$esc_user}
+  bootstrap_script=${bootstrap_script//__REPO_URL__/$esc_repo}
+  bootstrap_script=${bootstrap_script//__REPO_REF__/$esc_ref}
 
   unit_contents=$(cat <<EOF
 [Unit]
@@ -177,12 +189,7 @@ WantedBy=multi-user.target
 EOF
 )
 
-  tmp_bootstrap=$(mktemp)
-  trap 'rm -f "$tmp_bootstrap"' RETURN
-  printf "%s" "$bootstrap_script" >"$tmp_bootstrap"
-
-  bootstrap_b64=$(b64_file "$tmp_bootstrap")
-  unit_b64=$(printf "%s" "$unit_contents" | b64_file /dev/stdin)
+  bootstrap_b64=$(printf "%s" "$bootstrap_script" | b64_file /dev/stdin)
 
   hostname_file=""
   if [ -n "$HOSTNAME" ]; then
@@ -285,6 +292,10 @@ done
 
 if [ -z "$OUT_DIR" ]; then
   OUT_DIR="$PWD/out/fcos-usb-${USERNAME}"
+fi
+
+if ! [[ "$DISK_SIZE_GIB" =~ ^[0-9]+$ ]] || [ "$DISK_SIZE_GIB" -le 0 ]; then
+  die "--size-gib must be a positive integer (got: $DISK_SIZE_GIB)"
 fi
 
 if [ "$PROMPT_PASSWORD" -eq 1 ] && [ -z "$PASSWORD_HASH" ]; then

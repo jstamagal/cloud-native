@@ -48,3 +48,17 @@ bin/fcos-usb-image --password --ssh-key ~/.ssh/id_ed25519.pub
 sudo dd if=out/fcos-usb-$USER/fcos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 Boot it on diskless or any machine; first boot clones this repo and sets up your user.
+
+## Quick FCOS USB debug in QEMU (UEFI)
+```bash
+# build the image if you haven't yet
+bin/fcos-usb-image --password-hash '<hash>' --ssh-key ~/.ssh/id_ed25519.pub --no-build
+
+# boot it safely with snapshot mode and SSH forward on 2222
+bin/fcos-usb-qemu --image out/fcos-usb-$USER/fcos-usb.img
+```
+- Requires `qemu-system-x86_64` and OVMF firmware (package: `edk2-ovmf` on Fedora).
+- Defaults: snapshot=on (base image untouched), KVM if available, 4 vCPUs, 4 GiB RAM,
+  UEFI boot, and `127.0.0.1:2222 -> guest:22`.
+- Disable port forward: `--ssh-port 0`; make writes persistent: `--no-snapshot`;
+  prefer a GUI window: `--gui`.

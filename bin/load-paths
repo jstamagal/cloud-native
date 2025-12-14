@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# Load custom program directories into the environment (PATH, LD_LIBRARY_PATH, etc).
+# Designed to be sourced from .bashrc or run directly.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+# Configuration
+BASE_DIRS=(
+  "${HOME}/dhome/shared"
+  "${HOME}/.local/shared"
+  "${HOME}/programs"
+  "${DISTROBOX_HOST_HOME:-}/dhome/shared"
+  "${DISTROBOX_HOST_HOME:-}/.local/shared"
+  "${DISTROBOX_HOST_HOME:-}/programs"
+  "/opt"
+)
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/load-paths/directories.conf"
+QUIET=0
+SKIP_GUI=0
+LIST_ONLY=0
+
+usage() {
+  cat <<EOF
+load-paths [options]
+
+Load custom program directories into environment (PATH, LD_LIBRARY_PATH, etc).
+
+Options:
+  -q, --quiet     suppress output
+  -n, --no-gui    skip desktop/icon cache updates
+  -l, --list      list configured base directories and exit
+  -h, --help      show this help
+
+Environment Variables:
+  LOAD_PATHS_QUIET=1      same as --quiet
+  LOAD_PATHS_SKIP_GUI=1   same as --no-gui
+
+Config:
+  Additional base dirs (one per line) in:
+    $CONFIG_FILE
+EOF
+  exit 1
+}
+
+add_to_path_var() {
+  local var_name=$1
+  local new_path=$2
+  local current_value
+  current_value=$(eval "echo \"\${${var_name}:-}\"")
+
+  case ":${current_value}:" in
+    *":${new_path}:"*) return 1;;
+  esac
+
+  if [ -z "$current_value" ]; then
+    eval "export $var_name=\"$new_path\""
+  else
+    eval "export $var_name=\"${new_path}:\${$var_name}\""
+  fi
+  return 0
+}
+
+load_config_file() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [ -z "${line// }" ] && continue
+    expanded=$(eval echo "$line" 2>/dev/null || echo "$line")
+    [ -d "$expanded" ] && BASE_DIRS+=("$expanded")
+  done < "$CONFIG_FILE"
+}
+
+is_gui_session() {
+  [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
+}
+
+process_program() {
+  local program_dir=$1
+  local program_name
+  program_name=$(basename "$program_dir")
+  local found=0
+
+  [ "$QUIET" -eq 0 ] && log "[$program_name]"
+
+  # Binaries
+  for bin_dir in bin sbin usr/bin usr/local/bin; do
+    [ -d "${program_dir}${bin_dir}" ] || continue
+    if add_to_path_var PATH "${program_dir}${bin_dir}"; then
+      [ "$QUIET" -eq 0 ] && log "  ${bin_dir} -> PATH"
+      found=1
+    fi
+  done
+
+  # Libraries
+  for lib_dir in lib lib64 usr/lib usr/lib64; do
+    [ -d "${program_dir}${lib_dir}" ] || continue
+    if add_to_path_var LD_LIBRARY_PATH "${program_dir}${lib_dir}"; then
+      [ "$QUIET" -eq 0 ] && log "  ${lib_dir} -> LD_LIBRARY_PATH"
+      found=1
+    fi
+  done
+
+  # pkg-config
+  for pc_dir in lib/pkgconfig lib64/pkgconfig share/pkgconfig; do
+    [ -d "${program_dir}${pc_dir}" ] || continue
+    if add_to_path_var PKG_CONFIG_PATH "${program_dir}${pc_dir}"; then
+      [ "$QUIET" -eq 0 ] && log "  ${pc_dir} -> PKG_CONFIG_PATH"
+      found=1
+    fi
+  done
+
+  # Man pages
+  for man_dir in share/man man; do
+    [ -d "${program_dir}${man_dir}" ] || continue
+    if add_to_path_var MANPATH "${program_dir}${man_dir}"; then
+      [ "$QUIET" -eq 0 ] && log "  ${man_dir} -> MANPATH"
+      found=1
+    fi
+  done
+
+  # XDG data
+  if [ -d "${program_dir}share" ]; then
+    if add_to_path_var XDG_DATA_DIRS "${program_dir}share"; then
+      [ "$QUIET" -eq 0 ] && log "  share -> XDG_DATA_DIRS"
+      found=1
+    fi
+  fi
+
+  # Include files
+  for inc_dir in include usr/include; do
+    [ -d "${program_dir}${inc_dir}" ] || continue
+    if add_to_path_var C_INCLUDE_PATH "${program_dir}${inc_dir}"; then
+      add_to_path_var CPLUS_INCLUDE_PATH "${program_dir}${inc_dir}"
+      [ "$QUIET" -eq 0 ] && log "  ${inc_dir} -> C_INCLUDE_PATH"
+      found=1
+    fi
+  done
+
+  # CMake
+  if [ -d "${program_dir}lib/cmake" ]; then
+    if add_to_path_var CMAKE_PREFIX_PATH "$program_dir"; then
+      [ "$QUIET" -eq 0 ] && log "  cmake -> CMAKE_PREFIX_PATH"
+      found=1
+    fi
+  fi
+
+  # Python site-packages
+  for py_dir in "${program_dir}lib/python"*/site-packages; do
+    [ -d "$py_dir" ] || continue
+    if add_to_path_var PYTHONPATH "$py_dir"; then
+      [ "$QUIET" -eq 0 ] && log "  $(basename "$(dirname "$py_dir")")/site-packages -> PYTHONPATH"
+      found=1
+    fi
+  done
+
+  # GUI updates (optional)
+  if [ "$SKIP_GUI" -eq 0 ] && is_gui_session; then
+    if [ -d "${program_dir}share/applications" ] && have update-desktop-database; then
+      update-desktop-database "${program_dir}share/applications/" 2>/dev/null && \
+        [ "$QUIET" -eq 0 ] && log "  updated desktop database"
+    fi
+
+    for icon_dir in share/icons/hicolor icons/hicolor; do
+      [ -d "${program_dir}${icon_dir}" ] || continue
+      if have gtk-update-icon-cache; then
+        gtk-update-icon-cache -q "${program_dir}${icon_dir}/" 2>/dev/null && \
+          [ "$QUIET" -eq 0 ] && log "  updated icon cache"
+      fi
+      break
+    done
+
+    if [ -d "${program_dir}share/glib-2.0/schemas" ] && have glib-compile-schemas; then
+      glib-compile-schemas "${program_dir}share/glib-2.0/schemas/" 2>/dev/null && \
+        [ "$QUIET" -eq 0 ] && log "  compiled GSettings schemas"
+    fi
+  fi
+
+  # Source custom env
+  if [ -f "${program_dir}env.sh" ]; then
+    # shellcheck source=/dev/null
+    . "${program_dir}env.sh" && [ "$QUIET" -eq 0 ] && log "  sourced env.sh"
+  fi
+
+  [ "$found" -eq 0 ] && [ "$QUIET" -eq 0 ] && log "  (no standard directories)"
+}
+
+list_directories() {
+  echo "Configured base directories:"
+  for dir in "${BASE_DIRS[@]}"; do
+    expanded=$(eval echo "$dir" 2>/dev/null || echo "$dir")
+    if [ -d "$expanded" ]; then
+      echo "  ✓ $expanded"
+    else
+      echo "  ✗ $expanded (not found)"
+    fi
+  done
+  if [ -f "$CONFIG_FILE" ]; then
+    echo ""
+    echo "From config file ($CONFIG_FILE):"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [ -z "${line// }" ] && continue
+      expanded=$(eval echo "$line" 2>/dev/null || echo "$line")
+      if [ -d "$expanded" ]; then
+        echo "  ✓ $expanded"
+      else
+        echo "  ✗ $expanded (not found)"
+      fi
+    done < "$CONFIG_FILE"
+  fi
+}
+
+# Argument parsing
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -q|--quiet) QUIET=1; shift;;
+    -n|--no-gui) SKIP_GUI=1; shift;;
+    -l|--list) LIST_ONLY=1; shift;;
+    -h|--help) usage;;
+    *) die "unknown option: $1";;
+  esac
+done
+
+[ "${LOAD_PATHS_QUIET:-0}" -eq 1 ] && QUIET=1
+[ "${LOAD_PATHS_SKIP_GUI:-0}" -eq 1 ] && SKIP_GUI=1
+
+if [ "$LIST_ONLY" -eq 1 ]; then
+  list_directories
+  exit 0
+fi
+
+load_config_file
+
+[ "$QUIET" -eq 0 ] && log "loading custom program paths..."
+
+program_count=0
+base_count=0
+
+for base_dir in "${BASE_DIRS[@]}"; do
+  expanded=$(eval echo "$base_dir" 2>/dev/null || echo "$base_dir")
+  [ -d "$expanded" ] || continue
+  ((base_count++))
+
+  for program_dir in "$expanded"/*/; do
+    [ -d "$program_dir" ] || continue
+    process_program "$program_dir"
+    ((program_count++))
+  done
+done
+
+# Ensure MANPATH trailing colon to include system paths
+[ -n "${MANPATH:-}" ] && export MANPATH="${MANPATH}:"
+
+[ "$QUIET" -eq 0 ] && log "processed $program_count program(s) from $base_count base director(ies)"

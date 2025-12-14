@@ -21,8 +21,8 @@ Helper scripts that turn Fedora CoreOS into a comfortable desktop + development 
 bin/doctor
 
 # create baseline boxes from profiles
-bin/dbx-create toolboxes/userland.ini --yes
-bin/dbx-create toolboxes/desktop.ini --yes
+bin/dbx-create toolboxes/userland.ini --yes --auto-name --hostname random
+bin/dbx-create toolboxes/desktop.ini --yes --auto-name --hostname random
 
 # verify where you are
 bin/detect-env
@@ -72,6 +72,10 @@ GUI_SYSTEM_BUS=0
 PREINSTALL=git make curl
 ```
 Then `bin/dbx-create toolboxes/mybox.ini --yes`.
+
+### Auto-naming and hostnames
+- `--auto-name` generates a name as `<profile>-<hostname>` (e.g., `desktop-thunderhawk`).
+- `--hostname NAME|random` sets the distrobox hostname; `random` picks a codename.
 
 ## Quadlets in a nutshell
 - Files land in `~/.config/containers/systemd/<name>.container`.

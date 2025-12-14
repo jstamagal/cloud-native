@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Boot a generated FCOS USB image under QEMU with UEFI for fast debugging.
+#
+# Defaults:
+#   - loads ./out/fcos-usb-$USER/fcos-usb.img
+#   - uses OVMF (UEFI) firmware if present
+#   - prefers KVM; falls back to TCG
+#   - runs in snapshot mode so the raw image stays untouched
+#   - forwards host 127.0.0.1:2222 -> guest:22 for SSH
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh disable=SC1091
+. "$SCRIPT_DIR/../lib/common.sh"
+
+IMAGE=""
+MEM_MB=4096
+CPUS=4
+SSH_PORT=2222
+USE_KVM=1
+SNAPSHOT=1
+GUI=0
+EFI_CODE=""
+EFI_VARS=""
+PERSIST_VARS=0
+NAME="fcos-usb-debug"
+EXTRA_ARGS=()
+
+usage() {
+  cat <<EOF
+fcos-usb-qemu [options]
+
+Run a FCOS USB image in a modern UEFI QEMU session for quick debugging.
+
+Options:
+  --image PATH          raw disk image (default: ./out/fcos-usb-\$USER/fcos-usb.img)
+  --memory MB           guest memory in MiB (default: 4096)
+  --cpus N              vCPUs (default: 4)
+  --ssh-port PORT       host TCP port to forward to guest 22 (default: 2222, 0 disables)
+  --no-kvm              force TCG even if /dev/kvm is available
+  --no-snapshot         persist guest writes to the raw image (default: snapshot=on)
+  --gui                 enable QEMU default display (requires local GUI); default is console
+  --efi-code PATH       OVMF_CODE.fd path (firmware, read-only)
+  --efi-vars PATH       OVMF_VARS.fd path (template for vars)
+  --persist-vars        use --efi-vars in place (default copies to a temp file)
+  --name NAME           QEMU VM/process name (default: fcos-usb-debug)
+  --                    pass all following args directly to qemu-system-x86_64
+  -h, --help            show this help
+
+Safe defaults:
+  - Snapshot mode keeps the base image untouched unless --no-snapshot is used.
+  - Port forwarding binds to 127.0.0.1 only.
+EOF
+  exit 1
+}
+
+find_ovmf() {
+  local codes=(
+    /usr/share/edk2/ovmf/OVMF_CODE.fd
+    /usr/share/OVMF/OVMF_CODE.fd
+    /usr/share/edk2/x64/OVMF_CODE.fd
+  )
+  local vars=(
+    /usr/share/edk2/ovmf/OVMF_VARS.fd
+    /usr/share/OVMF/OVMF_VARS.fd
+    /usr/share/edk2/x64/OVMF_VARS.fd
+  )
+
+  for c in "${codes[@]}"; do
+    [ -f "$c" ] && EFI_CODE=${EFI_CODE:-$c} && break
+  done
+  for v in "${vars[@]}"; do
+    [ -f "$v" ] && EFI_VARS=${EFI_VARS:-$v} && break
+  done
+}
+
+check_kvm() {
+  if [ "$USE_KVM" -eq 0 ]; then
+    echo "tcg"
+    return
+  fi
+  if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    echo "kvm"
+  else
+    log "KVM not available (using TCG; slower). Ensure you're in the kvm group or enable /dev/kvm."
+    echo "tcg"
+  fi
+}
+
+copy_vars_temp() {
+  [ "$PERSIST_VARS" -eq 1 ] && { echo "$EFI_VARS"; return; }
+  local tmp
+  tmp=$(mktemp /tmp/ovmf-vars.XXXXXX.fd)
+  cp "$EFI_VARS" "$tmp"
+  echo "$tmp"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage;;
+    --image) IMAGE=$2; shift 2;;
+    --memory) MEM_MB=$2; shift 2;;
+    --cpus) CPUS=$2; shift 2;;
+    --ssh-port) SSH_PORT=$2; shift 2;;
+    --no-kvm) USE_KVM=0; shift;;
+    --no-snapshot) SNAPSHOT=0; shift;;
+    --gui) GUI=1; shift;;
+    --efi-code) EFI_CODE=$2; shift 2;;
+    --efi-vars) EFI_VARS=$2; shift 2;;
+    --persist-vars) PERSIST_VARS=1; shift;;
+    --name) NAME=$2; shift 2;;
+    --) shift; EXTRA_ARGS+=("$@"); break;;
+    *) usage;;
+  esac
+done
+
+if [ -z "$IMAGE" ]; then
+  IMAGE="$PWD/out/fcos-usb-${USER:-core}/fcos-usb.img"
+fi
+
+[[ "$MEM_MB" =~ ^[0-9]+$ ]] || die "--memory must be an integer (MiB)"
+[[ "$CPUS" =~ ^[0-9]+$ ]] || die "--cpus must be an integer"
+[[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "--ssh-port must be an integer"
+
+ensure_commands qemu-system-x86_64 cp mktemp
+[ -f "$IMAGE" ] || die "image not found: $IMAGE (build it with bin/fcos-usb-image)"
+
+find_ovmf
+[ -n "$EFI_CODE" ] || die "OVMF code image not found; install edk2-ovmf / ovmf packages or pass --efi-code"
+[ -n "$EFI_VARS" ] || die "OVMF vars image not found; install edk2-ovmf / ovmf packages or pass --efi-vars"
+
+efi_vars_runtime=$(copy_vars_temp)
+cleanup() { [ "$PERSIST_VARS" -eq 0 ] && rm -f "$efi_vars_runtime"; }
+trap cleanup EXIT
+
+accel=$(check_kvm)
+cpu="qemu64"
+[ "$accel" = "kvm" ] && cpu="host"
+
+disk_drive_opts="if=none,id=disk0,file=$IMAGE,format=raw,aio=threads,cache=none"
+[ "$SNAPSHOT" -eq 1 ] && disk_drive_opts="$disk_drive_opts,snapshot=on"
+
+netdev_opts="user,id=net0"
+if [ "$SSH_PORT" -gt 0 ]; then
+  netdev_opts="$netdev_opts,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
+fi
+
+display_opts=(-display none -serial mon:stdio)
+[ "$GUI" -eq 1 ] && display_opts=(-display default -serial mon:stdio)
+
+# shellcheck disable=SC2054  # qemu options use commas inside single args (e.g., -name foo,process=foo)
+cmd=(
+  qemu-system-x86_64
+  -name "$NAME",process="$NAME"
+  -machine q35,accel="$accel"
+  -cpu "$cpu"
+  -smp "$CPUS"
+  -m "$MEM_MB"
+  -nodefaults
+  -drive if=pflash,format=raw,readonly=on,file="$EFI_CODE"
+  -drive if=pflash,format=raw,file="$efi_vars_runtime"
+  -drive "$disk_drive_opts"
+  -device virtio-blk-pci,drive=disk0
+  -netdev "$netdev_opts"
+  -device virtio-net-pci,netdev=net0
+  -device virtio-rng-pci
+  "${display_opts[@]}"
+)
+
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+  cmd+=("${EXTRA_ARGS[@]}")
+fi
+
+log "Launching QEMU (image=$(basename "$IMAGE"), accel=$accel, snapshot=$SNAPSHOT, ssh_port=$SSH_PORT)..."
+exec "${cmd[@]}"
