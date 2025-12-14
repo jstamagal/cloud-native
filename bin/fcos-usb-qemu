@@ -19,7 +19,7 @@ CPUS=4
 SSH_PORT=2222
 USE_KVM=1
 SNAPSHOT=1
-GUI=0
+GUI=1
 EFI_CODE=""
 EFI_VARS=""
 PERSIST_VARS=0
@@ -39,7 +39,8 @@ Options:
   --ssh-port PORT       host TCP port to forward to guest 22 (default: 2222, 0 disables)
   --no-kvm              force TCG even if /dev/kvm is available
   --no-snapshot         persist guest writes to the raw image (default: snapshot=on)
-  --gui                 enable QEMU default display (requires local GUI); default is console
+  --gui                 enable QEMU default display (default)
+  --headless            disable display (serial console only)
   --efi-code PATH       OVMF_CODE.fd path (firmware, read-only)
   --efi-vars PATH       OVMF_VARS.fd path (template for vars)
   --persist-vars        use --efi-vars in place (default copies to a temp file)
@@ -101,10 +102,11 @@ while [ "$#" -gt 0 ]; do
     --image) IMAGE=$2; shift 2;;
     --memory) MEM_MB=$2; shift 2;;
     --cpus) CPUS=$2; shift 2;;
-    --ssh-port) SSH_PORT=$2; shift 2;;
-    --no-kvm) USE_KVM=0; shift;;
-    --no-snapshot) SNAPSHOT=0; shift;;
-    --gui) GUI=1; shift;;
+  --ssh-port) SSH_PORT=$2; shift 2;;
+  --no-kvm) USE_KVM=0; shift;;
+  --no-snapshot) SNAPSHOT=0; shift;;
+  --gui) GUI=1; shift;;
+  --headless) GUI=0; shift;;
     --efi-code) EFI_CODE=$2; shift 2;;
     --efi-vars) EFI_VARS=$2; shift 2;;
     --persist-vars) PERSIST_VARS=1; shift;;
@@ -145,8 +147,8 @@ if [ "$SSH_PORT" -gt 0 ]; then
   netdev_opts="$netdev_opts,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
 fi
 
-display_opts=(-display none -serial mon:stdio)
-[ "$GUI" -eq 1 ] && display_opts=(-display default -serial mon:stdio)
+display_opts=(-display default -vga std -serial mon:stdio)
+[ "$GUI" -eq 0 ] && display_opts=(-display none -serial mon:stdio)
 
 # shellcheck disable=SC2054  # qemu options use commas inside single args (e.g., -name foo,process=foo)
 cmd=(

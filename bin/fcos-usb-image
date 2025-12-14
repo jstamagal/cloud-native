@@ -124,6 +124,21 @@ add_default_ssh_keys() {
   shopt -u nullglob
 }
 
+dedup_ssh_keys() {
+  # Remove duplicate key contents while preserving order.
+  declare -A seen=()
+  uniq_keys=()
+  for k in "${SSH_KEYS[@]}"; do
+    [ -f "$k" ] || continue
+    content=$(cat "$k")
+    if [ -z "${seen[$content]+x}" ]; then
+      seen[$content]=1
+      uniq_keys+=("$k")
+    fi
+  done
+  SSH_KEYS=("${uniq_keys[@]}")
+}
+
 json_escape() {
   s=$1
   s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
@@ -144,6 +159,7 @@ write_ignition() {
   log "[ignition] building ignition"
   mkdir -p "$OUT_DIR"
   add_default_ssh_keys
+  dedup_ssh_keys
   [ "${#SSH_KEYS[@]}" -gt 0 ] || die "no SSH public keys found; pass --ssh-key ~/.ssh/id_ed25519.pub"
   log "[ignition] using SSH keys: ${SSH_KEYS[*]}"
   [ -n "$PASSWORD_HASH" ] || die "password hash missing (use --password or --password-hash)"
@@ -243,6 +259,20 @@ EOF
 
   log "wrote $OUT_DIR/ignition.json"
   log "[ignition] done"
+}
+
+validate_ignition() {
+  log "[validate] validating ignition via coreos-installer (container)"
+  podman run --pull=always --rm -v "$OUT_DIR":/data:z \
+    --entrypoint /bin/sh \
+    quay.io/coreos/coreos-installer:release \
+    -c 'set -euo pipefail
+if coreos-installer ignition --help >/dev/null 2>&1; then
+  coreos-installer ignition validate /data/ignition.json
+  echo "[validate] ignition ok"
+else
+  echo "[validate] WARNING: installer image lacks ignition validate; skipped"
+fi'
 }
 
 install_image() {
@@ -348,6 +378,7 @@ fi
 
 log "[prep] output dir: $OUT_DIR"
 write_ignition
+validate_ignition
 log "[plan] build=$DO_BUILD run_qemu=$RUN_QEMU"
 
 if [ "$DO_BUILD" -eq 1 ]; then
