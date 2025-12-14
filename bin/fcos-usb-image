@@ -266,19 +266,49 @@ EOF
 build_raw_image() {
   img="$OUT_DIR/fcos-usb.img"
 
-  ensure_commands losetup truncate
+  ensure_commands truncate
 
   if [ "$(id -u)" -ne 0 ] && ! have sudo; then
     die "building a raw image requires root; re-run as root or install sudo"
   fi
 
   log "creating disk image: ${DISK_SIZE_GIB}GiB"
+  mkdir -p "$OUT_DIR"
   truncate -s "${DISK_SIZE_GIB}G" "$img"
-
-  loopdev=$(sudo_maybe losetup --find --show "$img")
-  trap 'sudo_maybe losetup -d "$loopdev" >/dev/null 2>&1 || true' RETURN
+  [ -f "$img" ] || die "failed to create disk image at $img"
+  img_real=$(realpath -m "$img")
 
   if have coreos-installer; then
+    ensure_commands losetup
+
+    if [ ! -e /dev/loop-control ]; then
+      log "/dev/loop-control missing; attempting to load loop module via sudo modprobe loop"
+      sudo_maybe modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
+    fi
+
+    # Ensure basic loop device nodes exist (/dev/loop0..7). Some hosts ship only loop-control.
+    if ! ls /dev/loop0 >/dev/null 2>&1; then
+      for i in $(seq 0 7); do
+        dev="/dev/loop${i}"
+        if [ ! -e "$dev" ]; then
+          sudo_maybe mknod "$dev" b 7 "$i" || true
+          sudo_maybe chmod 660 "$dev" || true
+        fi
+      done
+    fi
+
+    if ! sudo_maybe test -f "$img_real"; then
+      die "disk image vanished before losetup: $img_real"
+    fi
+
+    loopdev=$(sudo_maybe sh -c "losetup --find --show \"$img_real\" 2>/tmp/losetup.err" ) || {
+      err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
+      rm -f /tmp/losetup.err
+      die "failed to set up loop device for $img_real: ${err_msg:-unknown error}"
+    }
+    rm -f /tmp/losetup.err
+    trap 'sudo_maybe losetup -d "$loopdev" >/dev/null 2>&1 || true' RETURN
+
     log "installing FCOS to $loopdev (stream=$STREAM arch=$ARCH platform=$PLATFORM) via local coreos-installer"
     sudo_maybe coreos-installer install "$loopdev" \
       --stream "$STREAM" \
@@ -286,9 +316,43 @@ build_raw_image() {
       --platform "$PLATFORM" \
       --ignition-file "$OUT_DIR/ignition.json"
   else
-    ensure_commands podman
-    log "coreos-installer not found; using containerized installer (pulls quay.io/coreos/coreos-installer:release)"
-    sudo_maybe podman run --pull=always --privileged --rm \
+    if [ "$(id -u)" -ne 0 ]; then
+      if have sudo; then
+        PODMAN="sudo podman"
+      else
+        die "coreos-installer missing: install it or rerun with sudo so we can use the container fallback"
+      fi
+    else
+      PODMAN="podman"
+    fi
+    ensure_commands losetup podman
+
+    if [ ! -e /dev/loop-control ]; then
+      log "/dev/loop-control missing; attempting to load loop module via sudo modprobe loop"
+      sudo_maybe modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
+    fi
+    if ! ls /dev/loop0 >/dev/null 2>&1; then
+      for i in $(seq 0 7); do
+        dev="/dev/loop${i}"
+        if [ ! -e "$dev" ]; then
+          sudo_maybe mknod "$dev" b 7 "$i" || true
+          sudo_maybe chmod 660 "$dev" || true
+        fi
+      done
+    fi
+
+    loopdev=$(sudo_maybe sh -c "losetup --find --show \"$img_real\" 2>/tmp/losetup.err" ) || {
+      err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
+      rm -f /tmp/losetup.err
+      die "container fallback: failed to set up loop device for $img_real: ${err_msg:-unknown error}"
+    }
+    rm -f /tmp/losetup.err
+    trap 'sudo_maybe losetup -d "$loopdev" >/dev/null 2>&1 || true' RETURN
+
+    log "installing FCOS via containerized coreos-installer (loop=$loopdev)"
+    $PODMAN run --pull=always --privileged --rm \
+      --security-opt label=disable \
+      --device "$loopdev" \
       -v /dev:/dev \
       -v /run/udev:/run/udev \
       -v "$OUT_DIR":/data:z \
@@ -301,8 +365,10 @@ build_raw_image() {
   fi
 
   sudo_maybe sync
-  sudo_maybe losetup -d "$loopdev"
-  trap - RETURN
+  if [ -n "${loopdev:-}" ]; then
+    sudo_maybe losetup -d "$loopdev"
+    trap - RETURN
+  fi
 
   log "wrote $img"
 }
