@@ -278,32 +278,71 @@ build_raw_image() {
   [ -f "$img" ] || die "failed to create disk image at $img"
   img_real=$(realpath -m "$img")
 
-have coreos-installer || die "coreos-installer binary is required; install it (e.g., sudo rpm-ostree install coreos-installer) and rerun"
+if ! have coreos-installer; then
+  [ "$(id -u)" -eq 0 ] || die "coreos-installer missing: run this command with sudo to use the bundled container installer"
+fi
+
 ensure_commands losetup
 
 if [ ! -e /dev/loop-control ]; then
-  log "/dev/loop-control missing; attempting to load loop module via sudo modprobe loop"
-  sudo_maybe modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
+  log "/dev/loop-control missing; attempting to load loop module (modprobe loop)"
+  if [ "$(id -u)" -eq 0 ]; then
+    modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
+  else
+    sudo_maybe modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
+  fi
 fi
 
-if ! sudo_maybe test -f "$img_real"; then
+if ! test -f "$img_real"; then
   die "disk image vanished before losetup: $img_real"
 fi
 
-loopdev=$(sudo_maybe sh -c "losetup --find --show \"$img_real\" 2>/tmp/losetup.err" ) || {
-  err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
-  rm -f /tmp/losetup.err
-  die "failed to set up loop device for $img_real: ${err_msg:-unknown error}"
-}
+if [ "$(id -u)" -eq 0 ]; then
+  loopdev=$(losetup --find --show "$img_real" 2>/tmp/losetup.err) || {
+    err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
+    rm -f /tmp/losetup.err
+    die "failed to set up loop device for $img_real: ${err_msg:-unknown error}"
+  }
+else
+  loopdev=$(sudo_maybe sh -c "losetup --find --show \"$img_real\" 2>/tmp/losetup.err" ) || {
+    err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
+    rm -f /tmp/losetup.err
+    die "failed to set up loop device for $img_real: ${err_msg:-unknown error}"
+  }
+fi
 rm -f /tmp/losetup.err
-trap 'sudo_maybe losetup -d "$loopdev" >/dev/null 2>&1 || true' RETURN
+trap '[ -n "${loopdev:-}" ] && { if [ "$(id -u)" -eq 0 ]; then losetup -d "$loopdev"; else sudo_maybe losetup -d "$loopdev"; fi; } >/dev/null 2>&1 || true' RETURN
 
-log "installing FCOS to $loopdev (stream=$STREAM arch=$ARCH platform=$PLATFORM) via local coreos-installer"
-sudo_maybe coreos-installer install "$loopdev" \
-  --stream "$STREAM" \
-  --architecture "$ARCH" \
-  --platform "$PLATFORM" \
-  --ignition-file "$OUT_DIR/ignition.json"
+if have coreos-installer; then
+  log "installing FCOS to $loopdev via host coreos-installer (stream=$STREAM arch=$ARCH platform=$PLATFORM)"
+  if [ "$(id -u)" -eq 0 ]; then
+    coreos-installer install "$loopdev" \
+      --stream "$STREAM" \
+      --architecture "$ARCH" \
+      --platform "$PLATFORM" \
+      --ignition-file "$OUT_DIR/ignition.json"
+  else
+    sudo_maybe coreos-installer install "$loopdev" \
+      --stream "$STREAM" \
+      --architecture "$ARCH" \
+      --platform "$PLATFORM" \
+      --ignition-file "$OUT_DIR/ignition.json"
+  fi
+else
+  log "installing FCOS to $loopdev via containerized coreos-installer (rootful podman)"
+  podman run --pull=always --privileged --rm \
+    --security-opt label=disable \
+    --device "$loopdev" \
+    -v /dev:/dev \
+    -v /run/udev:/run/udev \
+    -v "$OUT_DIR":/data:z \
+    quay.io/coreos/coreos-installer:release \
+    install "$loopdev" \
+      --stream "$STREAM" \
+      --architecture "$ARCH" \
+      --platform "$PLATFORM" \
+      --ignition-file /data/ignition.json
+fi
 
   sudo_maybe sync
   if [ -n "${loopdev:-}" ]; then
