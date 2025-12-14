@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# Build a bootable Fedora CoreOS disk image for running directly from USB.
+#
+# This creates:
+#  - an Ignition config that creates a user with SSH keys + password hash
+#  - a raw disk image installed via coreos-installer (written to a loop device)
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+OUT_DIR=""
+STREAM="stable"
+ARCH="x86_64"
+PLATFORM="metal"
+DISK_SIZE_GIB=16
+USERNAME="${USER:-core}"
+HOSTNAME=""
+REPO_URL="https://github.com/jstamagal/cloud-native.git"
+REPO_REF="main"
+PASSWORD_HASH=""
+PROMPT_PASSWORD=0
+SSH_KEYS=()
+DO_BUILD=1
+
+usage() {
+  cat <<EOF
+fcos-usb-image [options]
+
+Creates a bootable FCOS raw disk image suitable for writing to a USB stick.
+
+Options:
+  --out DIR               output directory (default: ./out/fcos-usb-<user>)
+  --stream NAME           FCOS stream (default: stable)
+  --arch ARCH             target arch (default: x86_64)
+  --platform NAME         ignition platform id (default: metal)
+  --size-gib N            disk image size in GiB (default: 16)
+
+  --user NAME             username to create (default: $USERNAME)
+  --hostname NAME         optional hostname to set
+  --ssh-key PATH          add SSH public key file (repeatable)
+
+  --password              prompt for a login password and hash it (requires openssl)
+  --password-hash HASH    provide an existing password hash (preferred for automation)
+
+  --repo URL              repo to clone on first boot (default: $REPO_URL)
+  --ref REF               git ref/branch to checkout (default: $REPO_REF)
+
+  --no-build              only generate ignition.json; do not build a raw image
+
+Notes:
+  - This does NOT copy private SSH keys.
+  - Building the raw image requires root (loop device + coreos-installer).
+EOF
+  exit 1
+}
+
+prompt_password_hash() {
+  ensure_commands openssl stty
+
+  pass1=""
+  pass2=""
+
+  printf "Password for %s: " "$USERNAME" >&2
+  stty -echo </dev/tty
+  IFS= read -r pass1 </dev/tty
+  stty echo </dev/tty
+  printf "\n" >&2
+
+  printf "Confirm password: " >&2
+  stty -echo </dev/tty
+  IFS= read -r pass2 </dev/tty
+  stty echo </dev/tty
+  printf "\n" >&2
+
+  [ "$pass1" = "$pass2" ] || die "passwords did not match"
+  [ -n "$pass1" ] || die "empty password not allowed"
+
+  # SHA-512 crypt.
+  PASSWORD_HASH=$(printf "%s\n" "$pass1" | openssl passwd -6 -stdin)
+}
+
+add_default_ssh_keys() {
+  # Add all public keys under ~/.ssh if no keys were explicitly provided.
+  [ "${#SSH_KEYS[@]}" -gt 0 ] && return 0
+  for f in "${HOME:-/dev/null}/.ssh"/*.pub; do
+    [ -f "$f" ] && SSH_KEYS+=("$f")
+  done
+}
+
+json_escape() {
+  # Minimal JSON string escaper.
+  # Usage: json_escape "string"
+  s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf "%s" "$s"
+}
+
+b64_file() {
+  # base64 without line wraps (GNU and busybox compatible-ish)
+  if base64 --help 2>/dev/null | grep -q -- "-w"; then
+    base64 -w0 "$1"
+  else
+    base64 "$1" | tr -d '\n'
+  fi
+}
+
+write_ignition() {
+  mkdir -p "$OUT_DIR"
+
+  add_default_ssh_keys
+  [ "${#SSH_KEYS[@]}" -gt 0 ] || die "no SSH public keys found; pass --ssh-key ~/.ssh/id_ed25519.pub"
+  [ -n "$PASSWORD_HASH" ] || die "password hash missing (use --password or --password-hash)"
+
+  ssh_json=""
+  for k in "${SSH_KEYS[@]}"; do
+    [ -f "$k" ] || die "ssh key not found: $k"
+    key_contents=$(cat "$k")
+    key_contents=$(json_escape "$key_contents")
+    if [ -z "$ssh_json" ]; then
+      ssh_json="\"$key_contents\""
+    else
+      ssh_json="$ssh_json,\"$key_contents\""
+    fi
+  done
+
+  bootstrap_script=$(cat <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+user="${USERNAME}"
+repo="${REPO_URL}"
+ref="${REPO_REF}"
+marker="/var/home/${USERNAME}/.cloud-native-bootstrapped"
+
+target_dir="/var/home/${USERNAME}/cloud-native"
+
+[ -e "$marker" ] && exit 0
+
+mkdir -p "$(dirname "$marker")"
+
+if ! command -v podman >/dev/null 2>&1; then
+  echo "podman not found; cannot bootstrap" >&2
+  exit 1
+fi
+
+# Clone using a container so we don't need git on the host.
+# Keep it simple: install git in the container, clone, checkout ref.
+podman run --rm \
+  -v "/var/home/${USERNAME}:/target" \
+  docker.io/library/fedora:41 \
+  bash -lc "dnf -y install git ca-certificates >/dev/null && rm -rf /target/cloud-native && git clone --depth 1 --branch '$ref' '$repo' /target/cloud-native"
+
+chown -R "${USERNAME}:${USERNAME}" "/var/home/${USERNAME}/cloud-native" || true
+
+touch "$marker"
+EOF
+)
+
+  unit_contents=$(cat <<EOF
+[Unit]
+Description=Bootstrap cloud-native desktop kit
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=!/var/home/${USERNAME}/.cloud-native-bootstrapped
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cloud-native-bootstrap
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+
+  tmp_bootstrap=$(mktemp)
+  trap 'rm -f "$tmp_bootstrap"' RETURN
+  printf "%s" "$bootstrap_script" >"$tmp_bootstrap"
+
+  bootstrap_b64=$(b64_file "$tmp_bootstrap")
+  unit_b64=$(printf "%s" "$unit_contents" | b64_file /dev/stdin)
+
+  hostname_file=""
+  if [ -n "$HOSTNAME" ]; then
+    hn_b64=$(printf "%s\n" "$HOSTNAME" | b64_file /dev/stdin)
+    hostname_file=$(cat <<EOF
+    ,{
+      "path": "/etc/hostname",
+      "mode": 420,
+      "contents": {"source": "data:;base64,${hn_b64}"}
+    }
+EOF
+)
+  fi
+
+  cat >"$OUT_DIR/ignition.json" <<EOF
+{
+  "ignition": {"version": "3.4.0"},
+  "passwd": {
+    "users": [
+      {
+        "name": "$(json_escape "$USERNAME")",
+        "groups": ["wheel"],
+        "passwordHash": "$(json_escape "$PASSWORD_HASH")",
+        "sshAuthorizedKeys": [${ssh_json}]
+      }
+    ]
+  },
+  "storage": {
+    "files": [
+      {
+        "path": "/usr/local/bin/cloud-native-bootstrap",
+        "mode": 493,
+        "contents": {"source": "data:;base64,${bootstrap_b64}"}
+      }${hostname_file}
+    ]
+  },
+  "systemd": {
+    "units": [
+      {
+        "name": "cloud-native-bootstrap.service",
+        "enabled": true,
+        "contents": "$(json_escape "$unit_contents")"
+      }
+    ]
+  }
+}
+EOF
+
+  log "wrote $OUT_DIR/ignition.json"
+}
+
+build_raw_image() {
+  img="$OUT_DIR/fcos-usb.img"
+
+  ensure_commands coreos-installer losetup truncate
+
+  if [ "$(id -u)" -ne 0 ] && ! have sudo; then
+    die "building a raw image requires root; re-run as root or install sudo"
+  fi
+
+  log "creating disk image: ${DISK_SIZE_GIB}GiB"
+  truncate -s "${DISK_SIZE_GIB}G" "$img"
+
+  loopdev=$(sudo_maybe losetup --find --show "$img")
+  trap 'sudo_maybe losetup -d "$loopdev" >/dev/null 2>&1 || true' RETURN
+
+  log "installing FCOS to $loopdev (stream=$STREAM arch=$ARCH platform=$PLATFORM)"
+  sudo_maybe coreos-installer install "$loopdev" \
+    --stream "$STREAM" \
+    --architecture "$ARCH" \
+    --platform "$PLATFORM" \
+    --ignition-file "$OUT_DIR/ignition.json"
+
+  sudo_maybe sync
+  sudo_maybe losetup -d "$loopdev"
+  trap - RETURN
+
+  log "wrote $img"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage;;
+    --out) OUT_DIR=$2; shift 2;;
+    --stream) STREAM=$2; shift 2;;
+    --arch) ARCH=$2; shift 2;;
+    --platform) PLATFORM=$2; shift 2;;
+    --size-gib) DISK_SIZE_GIB=$2; shift 2;;
+    --user) USERNAME=$2; shift 2;;
+    --hostname) HOSTNAME=$2; shift 2;;
+    --ssh-key) SSH_KEYS+=("$2"); shift 2;;
+    --password) PROMPT_PASSWORD=1; shift;;
+    --password-hash) PASSWORD_HASH=$2; shift 2;;
+    --repo) REPO_URL=$2; shift 2;;
+    --ref) REPO_REF=$2; shift 2;;
+    --no-build) DO_BUILD=0; shift;;
+    *) usage;;
+  esac
+done
+
+if [ -z "$OUT_DIR" ]; then
+  OUT_DIR="$PWD/out/fcos-usb-${USERNAME}"
+fi
+
+if [ "$PROMPT_PASSWORD" -eq 1 ] && [ -z "$PASSWORD_HASH" ]; then
+  prompt_password_hash
+fi
+
+write_ignition
+
+if [ "$DO_BUILD" -eq 1 ]; then
+  build_raw_image
+
+  cat <<EOF
+
+Next steps:
+  1) Write the image to a USB drive (DESTROYING its contents):
+
+     sudo dd if="$OUT_DIR/fcos-usb.img" of=/dev/sdX bs=4M conv=fsync status=progress
+
+  2) Boot from the USB. On first boot it will clone:
+
+     $REPO_URL (ref: $REPO_REF)
+
+Troubleshooting:
+  - If cloning fails, verify networking and re-run:
+      sudo systemctl restart cloud-native-bootstrap.service
+EOF
+else
+  cat <<EOF
+
+Ignition generated at:
+  $OUT_DIR/ignition.json
+
+To build a bootable USB image, install coreos-installer and re-run without --no-build.
+EOF
+fi

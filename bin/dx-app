@@ -51,25 +51,7 @@ install_pkgs() {
   local box=$1; shift
   [ "$#" -gt 0 ] || return 0
   log "[${box}] installing: $*"
-  distrobox enter --name "$box" -- /bin/sh -s "$@" <<'EOF'
-set -e
-pkgs="$*"
-pm=""
-for c in dnf microdnf yum apt-get apt zypper pacman apk xbps-install; do
-  command -v "$c" >/dev/null 2>&1 && { pm=$c; break; }
-done
-[ -n "$pm" ] || { echo "no supported package manager found" >&2; exit 1; }
-case "$pm" in
-  dnf|microdnf|yum) sudo -n "$pm" -y install "$@" 2>/dev/null || "$pm" -y install "$@";;
-  apt-get|apt) sudo -n apt-get update >/dev/null 2>&1 || apt-get update;
-               sudo -n apt-get install -y "$@" 2>/dev/null || apt-get install -y "$@";;
-  zypper) sudo -n zypper --non-interactive install "$@" 2>/dev/null || zypper --non-interactive install "$@";;
-  pacman) sudo -n pacman -Syu --noconfirm "$@" 2>/dev/null || pacman -Syu --noconfirm "$@";;
-  apk) sudo -n apk add "$@" 2>/dev/null || apk add "$@";;
-  xbps-install) sudo -n xbps-install -Sy "$@" 2>/dev/null || xbps-install -Sy "$@";;
-  *) echo "unsupported package manager: $pm" >&2; exit 1;;
-esac
-EOF
+  pkg_install_if_missing_in_box "$box" "$@"
 }
 
 export_app() {

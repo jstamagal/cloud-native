@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Diagnose common host prerequisites and footguns for this toolkit.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+  cat <<EOF
+doctor [--verbose]
+
+Checks:
+  - podman available + rootless
+  - distrobox available
+  - systemd --user connectivity (needed for quadlets)
+  - quadlet unit dir exists (or can be created)
+
+Exit codes:
+  0  all checks passed
+  1  one or more checks failed
+EOF
+  exit 1
+}
+
+VERBOSE=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage;;
+    -v|--verbose) VERBOSE=1; shift;;
+    *) usage;;
+  esac
+done
+
+is_container=0
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ]; then
+  is_container=1
+elif have systemd-detect-virt && systemd-detect-virt --quiet --container; then
+  is_container=1
+fi
+
+fail=0
+
+say() { printf "%s\n" "$*"; }
+
+ok() { say "ok:   $*"; }
+
+warn() { say "warn: $*"; }
+
+bad() {
+  say "fail: $*"
+  fail=1
+}
+
+check_cmd() {
+  local cmd=$1
+  if have "$cmd"; then
+    ok "found $cmd"
+  else
+    bad "missing dependency: $cmd"
+  fi
+}
+
+say "cloud-native desktop kit doctor"
+say "is_container=$is_container"
+say "os_id=$(detect_os_id)"
+say "os_pretty=$(detect_pretty_name)"
+say
+
+# ---- dependencies ----
+check_cmd podman
+check_cmd distrobox
+check_cmd systemctl
+
+# ---- podman rootless ----
+if have podman; then
+  rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)
+  if [ "$rootless" = "true" ]; then
+    ok "podman is rootless"
+  else
+    bad "podman is not rootless (or podman info failed)"
+    say "      fix: run as your normal user (not root)"
+    say "      fix: ensure subuid/subgid are configured (shadow-utils)"
+    say "      fix: on some systems you may need: sudo loginctl enable-linger \"$USER\""
+  fi
+
+  if [ "$VERBOSE" -eq 1 ]; then
+    podman_ver=$(podman --version 2>/dev/null || true)
+    [ -n "$podman_ver" ] && say "info: $podman_ver"
+  fi
+fi
+
+# ---- systemd user session ----
+# Quadlets are managed by systemd --user; this requires a working user bus.
+if have systemctl; then
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    ok "systemctl --user is reachable"
+  else
+    bad "systemctl --user is not reachable (no user bus?)"
+    say "      fix: log in via a session with systemd user services"
+    say "      fix: if you need user services at boot: sudo loginctl enable-linger \"$USER\""
+    say "      note: quadlets won't start without a user systemd instance"
+  fi
+fi
+
+# ---- quadlet unit dir ----
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd"
+if mkdir -p "$UNIT_DIR" 2>/dev/null; then
+  ok "quadlet unit dir present: $UNIT_DIR"
+else
+  bad "cannot create/access quadlet unit dir: $UNIT_DIR"
+  say "      fix: check HOME/XDG_CONFIG_HOME and filesystem permissions"
+fi
+
+# ---- distrobox basics ----
+if have distrobox; then
+  if distrobox --version >/dev/null 2>&1; then
+    ok "distrobox runs"
+  else
+    bad "distrobox is present but failed to run"
+  fi
+fi
+
+say
+if [ "$fail" -eq 0 ]; then
+  say "result=pass"
+  exit 0
+else
+  say "result=fail"
+  exit 1
+fi
