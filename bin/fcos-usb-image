@@ -260,10 +260,10 @@ install_image() {
     --entrypoint /bin/sh \
     quay.io/coreos/coreos-installer:release \
     -c 'set -euo pipefail; \
-      echo "inside container: finding loop for /data/fcos-usb.img"; \
-      loop=$(losetup --find --show /data/fcos-usb.img); \
-      trap "losetup -d $loop" EXIT; \
-      echo "inside container: loop=$loop; running coreos-installer"; \
+      echo "inside container: attaching loop (partscan) for /data/fcos-usb.img"; \
+      loop=$(losetup --find --show --partscan /data/fcos-usb.img); \
+      trap "losetup -d $loop || true" EXIT; \
+      echo \"inside container: loop=$loop; running coreos-installer\"; \
       coreos-installer install "$loop" \
         --stream '"$STREAM"' \
         --architecture '"$ARCH"' \
