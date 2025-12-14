@@ -62,3 +62,11 @@ bin/fcos-usb-qemu --image out/fcos-usb-$USER/fcos-usb.img
   UEFI boot, and `127.0.0.1:2222 -> guest:22`.
 - Disable port forward: `--ssh-port 0`; make writes persistent: `--no-snapshot`;
   prefer a GUI window: `--gui`.
+
+### One-shot build + boot
+```bash
+# build, then immediately boot it in QEMU with defaults
+bin/fcos-usb-image --password-hash '<hash>' --ssh-key ~/.ssh/id_ed25519.pub --run-qemu
+```
+- Add `--qemu-gui` for a window, `--qemu-no-kvm` if KVM is unavailable, or pass extra
+  QEMU args after `--` (e.g., `-- -device usb-tablet`).

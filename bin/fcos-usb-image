@@ -23,6 +23,15 @@ PASSWORD_HASH=""
 PROMPT_PASSWORD=0
 SSH_KEYS=()
 DO_BUILD=1
+RUN_QEMU=0
+QEMU_GUI=0
+QEMU_NO_KVM=0
+QEMU_NO_SNAPSHOT=0
+QEMU_SSH_PORT=2222
+QEMU_MEM_MB=4096
+QEMU_CPUS=4
+QEMU_NAME="fcos-usb-debug"
+QEMU_EXTRA=()
 
 usage() {
   cat <<EOF
@@ -48,6 +57,17 @@ Options:
   --ref REF               git ref/branch to checkout (default: $REPO_REF)
 
   --no-build              only generate ignition.json; do not build a raw image
+
+QEMU helpers (when --run-qemu is set):
+  --run-qemu              launch QEMU after building the image
+  --qemu-gui              open a QEMU display window (default: console)
+  --qemu-no-kvm           force TCG (software) if KVM is unavailable
+  --qemu-no-snapshot      persist writes to the base image (default: snapshot=on)
+  --qemu-ssh-port PORT    host port forwarded to guest 22 (default: $QEMU_SSH_PORT, 0 disables)
+  --qemu-memory MB        guest RAM in MiB (default: $QEMU_MEM_MB)
+  --qemu-cpus N           vCPUs (default: $QEMU_CPUS)
+  --qemu-name NAME        QEMU VM/process name (default: $QEMU_NAME)
+  --                      pass remaining args straight to bin/fcos-usb-qemu
 
 Notes:
   - This does NOT copy private SSH keys.
@@ -270,6 +290,29 @@ build_raw_image() {
   log "wrote $img"
 }
 
+run_qemu() {
+  local img="$OUT_DIR/fcos-usb.img"
+  [ -f "$img" ] || die "QEMU requested but image missing: $img"
+
+  cmd=(
+    "$SCRIPT_DIR/fcos-usb-qemu"
+    --image "$img"
+    --memory "$QEMU_MEM_MB"
+    --cpus "$QEMU_CPUS"
+    --name "$QEMU_NAME"
+    --ssh-port "$QEMU_SSH_PORT"
+  )
+  [ "$QEMU_GUI" -eq 1 ] && cmd+=(--gui)
+  [ "$QEMU_NO_KVM" -eq 1 ] && cmd+=(--no-kvm)
+  [ "$QEMU_NO_SNAPSHOT" -eq 1 ] && cmd+=(--no-snapshot)
+  if [ "${#QEMU_EXTRA[@]}" -gt 0 ]; then
+    cmd+=(-- "${QEMU_EXTRA[@]}")
+  fi
+
+  log "launching QEMU (image=$(basename "$img"), mem=${QEMU_MEM_MB}MB, cpus=$QEMU_CPUS, ssh_port=$QEMU_SSH_PORT)"
+  "${cmd[@]}"
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) usage;;
@@ -286,6 +329,15 @@ while [ "$#" -gt 0 ]; do
     --repo) REPO_URL=$2; shift 2;;
     --ref) REPO_REF=$2; shift 2;;
     --no-build) DO_BUILD=0; shift;;
+    --run-qemu) RUN_QEMU=1; shift;;
+    --qemu-gui) QEMU_GUI=1; shift;;
+    --qemu-no-kvm) QEMU_NO_KVM=1; shift;;
+    --qemu-no-snapshot) QEMU_NO_SNAPSHOT=1; shift;;
+    --qemu-ssh-port) QEMU_SSH_PORT=$2; shift 2;;
+    --qemu-memory) QEMU_MEM_MB=$2; shift 2;;
+    --qemu-cpus) QEMU_CPUS=$2; shift 2;;
+    --qemu-name) QEMU_NAME=$2; shift 2;;
+    --) shift; QEMU_EXTRA=("$@"); break;;
     *) usage;;
   esac
 done
@@ -296,6 +348,18 @@ fi
 
 if ! [[ "$DISK_SIZE_GIB" =~ ^[0-9]+$ ]] || [ "$DISK_SIZE_GIB" -le 0 ]; then
   die "--size-gib must be a positive integer (got: $DISK_SIZE_GIB)"
+fi
+if ! [[ "$QEMU_MEM_MB" =~ ^[0-9]+$ ]] || [ "$QEMU_MEM_MB" -le 0 ]; then
+  die "--qemu-memory must be a positive integer (got: $QEMU_MEM_MB)"
+fi
+if ! [[ "$QEMU_CPUS" =~ ^[0-9]+$ ]] || [ "$QEMU_CPUS" -le 0 ]; then
+  die "--qemu-cpus must be a positive integer (got: $QEMU_CPUS)"
+fi
+if ! [[ "$QEMU_SSH_PORT" =~ ^[0-9]+$ ]] || [ "$QEMU_SSH_PORT" -lt 0 ]; then
+  die "--qemu-ssh-port must be a non-negative integer (got: $QEMU_SSH_PORT)"
+fi
+if [ "$RUN_QEMU" -eq 1 ] && [ "$DO_BUILD" -eq 0 ]; then
+  die "--run-qemu requires building the image; remove --no-build"
 fi
 
 if [ "$PROMPT_PASSWORD" -eq 1 ] && [ -z "$PASSWORD_HASH" ]; then
@@ -330,4 +394,8 @@ Ignition generated at:
 
 To build a bootable USB image, install coreos-installer and re-run without --no-build.
 EOF
+fi
+
+if [ "$RUN_QEMU" -eq 1 ]; then
+  run_qemu
 fi
