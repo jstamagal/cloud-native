@@ -326,12 +326,19 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ "$(id -u)" -eq 0 ] || die "run this script with sudo (root required for losetup inside podman)"
-have podman || die "podman is required"
-
 if [ -z "$OUT_DIR" ]; then
   OUT_DIR="$PWD/out/fcos-usb-${USERNAME}"
 fi
+
+[ "$(id -u)" -eq 0 ] || die "run this script with sudo (root required for losetup inside podman)"
+have podman || die "podman is required"
+
+# Begin logging after OUT_DIR is known so we can tee to a file.
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/build.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+log "[log] capturing to $LOG_FILE"
+
 if ! [[ "$DISK_SIZE_GIB" =~ ^[0-9]+$ ]] || [ "$DISK_SIZE_GIB" -le 0 ]; then
   die "--size-gib must be a positive integer (got: $DISK_SIZE_GIB)"
 fi
