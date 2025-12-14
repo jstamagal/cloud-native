@@ -3,6 +3,7 @@
 # Root is required (for losetup inside a privileged podman container).
 
 set -euo pipefail
+set -x
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../lib/common.sh disable=SC1091
 . "$SCRIPT_DIR/../lib/common.sh"
@@ -98,9 +99,29 @@ prompt_password_hash() {
 
 add_default_ssh_keys() {
   [ "${#SSH_KEYS[@]}" -gt 0 ] && return 0
-  for f in "${HOME:-/dev/null}/.ssh"/*.pub; do
-    [ -f "$f" ] && SSH_KEYS+=("$f")
+
+  # Prefer the invoking user's keys (sudo), then the target user, then root.
+  shopt -s nullglob
+  candidates=()
+
+  if [ -n "${SUDO_USER:-}" ]; then
+    sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: '{print $6}')
+    [ -z "$sudo_home" ] && sudo_home=$(eval echo "~$SUDO_USER" 2>/dev/null || true)
+    [ -n "$sudo_home" ] && candidates+=("$sudo_home/.ssh")
+  fi
+
+  user_home=$(getent passwd "$USERNAME" 2>/dev/null | awk -F: '{print $6}')
+  [ -z "$user_home" ] && user_home=$(eval echo "~$USERNAME" 2>/dev/null || true)
+  [ -n "$user_home" ] && candidates+=("$user_home/.ssh")
+
+  candidates+=("${HOME:-/root}/.ssh")
+
+  for dir in "${candidates[@]}"; do
+    for f in "$dir"/*.pub; do
+      [ -f "$f" ] && SSH_KEYS+=("$f")
+    done
   done
+  shopt -u nullglob
 }
 
 json_escape() {
@@ -124,6 +145,7 @@ write_ignition() {
   mkdir -p "$OUT_DIR"
   add_default_ssh_keys
   [ "${#SSH_KEYS[@]}" -gt 0 ] || die "no SSH public keys found; pass --ssh-key ~/.ssh/id_ed25519.pub"
+  log "[ignition] using SSH keys: ${SSH_KEYS[*]}"
   [ -n "$PASSWORD_HASH" ] || die "password hash missing (use --password or --password-hash)"
 
   ssh_json=""
