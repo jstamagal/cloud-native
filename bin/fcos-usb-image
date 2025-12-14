@@ -257,8 +257,9 @@ install_image() {
     -v /dev:/dev \
     -v /run/udev:/run/udev \
     -v "$OUT_DIR":/data:z \
+    --entrypoint /bin/sh \
     quay.io/coreos/coreos-installer:release \
-    /bin/sh -c 'set -euo pipefail; \
+    -c 'set -euo pipefail; \
       echo "inside container: finding loop for /data/fcos-usb.img"; \
       loop=$(losetup --find --show /data/fcos-usb.img); \
       trap "losetup -d $loop" EXIT; \
