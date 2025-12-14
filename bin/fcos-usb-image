@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Build a bootable Fedora CoreOS disk image for running directly from USB.
-#
-# This creates:
-#  - an Ignition config that creates a user with SSH keys + password hash
-#  - a raw disk image installed via coreos-installer (written to a loop device)
+# Build a bootable Fedora CoreOS raw disk image and (optionally) boot it in QEMU.
+# Root is required (for losetup inside a privileged podman container).
 
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -38,6 +35,8 @@ usage() {
 fcos-usb-image [options]
 
 Creates a bootable FCOS raw disk image suitable for writing to a USB stick.
+Root is required. We use the official coreos-installer container (podman --privileged)
+so you don't need the binary on the host.
 
 Options:
   --out DIR               output directory (default: ./out/fcos-usb-<user>)
@@ -51,7 +50,7 @@ Options:
   --ssh-key PATH          add SSH public key file (repeatable)
 
   --password              prompt for a login password and hash it (requires openssl)
-  --password-hash HASH    provide an existing password hash (preferred for automation)
+  --password-hash HASH    provide an existing password hash
 
   --repo URL              repo to clone on first boot (default: $REPO_URL)
   --ref REF               git ref/branch to checkout (default: $REPO_REF)
@@ -70,20 +69,16 @@ QEMU helpers (when --run-qemu is set):
   --                      pass remaining args straight to bin/fcos-usb-qemu
 
 Notes:
-  - This does NOT copy private SSH keys.
-  - Building the raw image requires root (loop device + coreos-installer).
-  - If the `coreos-installer` binary is not installed, we transparently fall back to
-    the official container image via podman (requires privileged podman).
+  - Root required (losetup inside podman --privileged).
+  - Host does NOT need coreos-installer; we pull quay.io/coreos/coreos-installer:release.
 EOF
   exit 1
 }
 
 prompt_password_hash() {
   ensure_commands openssl stty
-
   pass1=""
   pass2=""
-
   printf "Password for %s: " "$USERNAME" >&2
   stty -echo </dev/tty
   IFS= read -r pass1 </dev/tty
@@ -98,13 +93,10 @@ prompt_password_hash() {
 
   [ "$pass1" = "$pass2" ] || die "passwords did not match"
   [ -n "$pass1" ] || die "empty password not allowed"
-
-  # SHA-512 crypt.
   PASSWORD_HASH=$(printf "%s\n" "$pass1" | openssl passwd -6 -stdin)
 }
 
 add_default_ssh_keys() {
-  # Add all public keys under ~/.ssh if no keys were explicitly provided.
   [ "${#SSH_KEYS[@]}" -gt 0 ] && return 0
   for f in "${HOME:-/dev/null}/.ssh"/*.pub; do
     [ -f "$f" ] && SSH_KEYS+=("$f")
@@ -112,36 +104,24 @@ add_default_ssh_keys() {
 }
 
 json_escape() {
-  # Minimal JSON string escaper.
-  # Usage: json_escape "string"
   s=$1
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
   printf "%s" "$s"
 }
 
-b64_file() {
-  # base64 without line wraps (GNU and busybox compatible-ish)
-  if base64 --help 2>/dev/null | grep -q -- "-w"; then
-    base64 -w0 "$1"
-  else
-    base64 "$1" | tr -d '\n'
-  fi
-}
-
 escape_for_dq() {
-  # Escape a string for safe use inside double quotes.
   local s=${1//\\/\\\\}
   s=${s//\"/\\\"}
   printf "%s" "$s"
 }
 
-write_ignition() {
-  mkdir -p "$OUT_DIR"
+b64_file() {
+  if base64 --help 2>/dev/null | grep -q -- "-w"; then base64 -w0 "$1"; else base64 "$1" | tr -d '\n'; fi
+}
 
+write_ignition() {
+  log "[ignition] building ignition"
+  mkdir -p "$OUT_DIR"
   add_default_ssh_keys
   [ "${#SSH_KEYS[@]}" -gt 0 ] || die "no SSH public keys found; pass --ssh-key ~/.ssh/id_ed25519.pub"
   [ -n "$PASSWORD_HASH" ] || die "password hash missing (use --password or --password-hash)"
@@ -149,13 +129,8 @@ write_ignition() {
   ssh_json=""
   for k in "${SSH_KEYS[@]}"; do
     [ -f "$k" ] || die "ssh key not found: $k"
-    key_contents=$(cat "$k")
-    key_contents=$(json_escape "$key_contents")
-    if [ -z "$ssh_json" ]; then
-      ssh_json="\"$key_contents\""
-    else
-      ssh_json="$ssh_json,\"$key_contents\""
-    fi
+    key_contents=$(json_escape "$(cat "$k")")
+    ssh_json="${ssh_json:+$ssh_json,}\"$key_contents\""
   done
 
   bootstrap_template=$(cat <<'EOF'
@@ -165,29 +140,14 @@ user="__USERNAME__"
 repo="__REPO_URL__"
 ref="__REPO_REF__"
 marker="/var/home/${user}/.cloud-native-bootstrapped"
-
 [ -e "$marker" ] && exit 0
-
 mkdir -p "$(dirname "$marker")"
-
-if ! command -v podman >/dev/null 2>&1; then
-  echo "podman not found; cannot bootstrap" >&2
-  exit 1
-fi
-
-# Clone using a container so we don't need git on the host.
-# Keep it simple: install git in the container, clone, checkout ref.
-podman run --rm \
-  -v "/var/home/${user}:/target" \
-  docker.io/library/fedora:41 \
+podman run --rm -v "/var/home/${user}:/target" docker.io/library/fedora:41 \
   bash -lc "dnf -y install git ca-certificates >/dev/null && rm -rf /target/cloud-native && git clone --depth 1 --branch \"$ref\" \"$repo\" /target/cloud-native"
-
 chown -R "${user}:${user}" "/var/home/${user}/cloud-native" || true
-
 touch "$marker"
 EOF
 )
-
   esc_user=$(escape_for_dq "$USERNAME")
   esc_repo=$(escape_for_dq "$REPO_URL")
   esc_ref=$(escape_for_dq "$REPO_REF")
@@ -212,7 +172,6 @@ EOF
 )
 
   bootstrap_b64=$(printf "%s" "$bootstrap_script" | b64_file /dev/stdin)
-
   hostname_file=""
   if [ -n "$HOSTNAME" ]; then
     hn_b64=$(printf "%s\n" "$HOSTNAME" | b64_file /dev/stdin)
@@ -261,96 +220,35 @@ EOF
 EOF
 
   log "wrote $OUT_DIR/ignition.json"
+  log "[ignition] done"
 }
 
-build_raw_image() {
-  img="$OUT_DIR/fcos-usb.img"
+install_image() {
+  img_real=$(realpath -m "$OUT_DIR/fcos-usb.img")
+  log "[1/3] allocating disk image ($DISK_SIZE_GIB GiB) at $img_real"
+  truncate -s "${DISK_SIZE_GIB}G" "$img_real"
 
-  ensure_commands truncate
-
-  if [ "$(id -u)" -ne 0 ] && ! have sudo; then
-    die "building a raw image requires root; re-run as root or install sudo"
-  fi
-
-  log "creating disk image: ${DISK_SIZE_GIB}GiB"
-  mkdir -p "$OUT_DIR"
-  truncate -s "${DISK_SIZE_GIB}G" "$img"
-  [ -f "$img" ] || die "failed to create disk image at $img"
-  img_real=$(realpath -m "$img")
-
-if ! have coreos-installer; then
-  [ "$(id -u)" -eq 0 ] || die "coreos-installer missing: run this command with sudo to use the bundled container installer"
-fi
-
-ensure_commands losetup
-
-if [ ! -e /dev/loop-control ]; then
-  log "/dev/loop-control missing; attempting to load loop module (modprobe loop)"
-  if [ "$(id -u)" -eq 0 ]; then
-    modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
-  else
-    sudo_maybe modprobe loop || die "loop device support not available; ensure /dev/loop-control exists"
-  fi
-fi
-
-if ! test -f "$img_real"; then
-  die "disk image vanished before losetup: $img_real"
-fi
-
-if [ "$(id -u)" -eq 0 ]; then
-  loopdev=$(losetup --find --show "$img_real" 2>/tmp/losetup.err) || {
-    err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
-    rm -f /tmp/losetup.err
-    die "failed to set up loop device for $img_real: ${err_msg:-unknown error}"
-  }
-else
-  loopdev=$(sudo_maybe sh -c "losetup --find --show \"$img_real\" 2>/tmp/losetup.err" ) || {
-    err_msg=$(cat /tmp/losetup.err 2>/dev/null || true)
-    rm -f /tmp/losetup.err
-    die "failed to set up loop device for $img_real: ${err_msg:-unknown error}"
-  }
-fi
-rm -f /tmp/losetup.err
-trap '[ -n "${loopdev:-}" ] && { if [ "$(id -u)" -eq 0 ]; then losetup -d "$loopdev"; else sudo_maybe losetup -d "$loopdev"; fi; } >/dev/null 2>&1 || true' RETURN
-
-if have coreos-installer; then
-  log "installing FCOS to $loopdev via host coreos-installer (stream=$STREAM arch=$ARCH platform=$PLATFORM)"
-  if [ "$(id -u)" -eq 0 ]; then
-    coreos-installer install "$loopdev" \
-      --stream "$STREAM" \
-      --architecture "$ARCH" \
-      --platform "$PLATFORM" \
-      --ignition-file "$OUT_DIR/ignition.json"
-  else
-    sudo_maybe coreos-installer install "$loopdev" \
-      --stream "$STREAM" \
-      --architecture "$ARCH" \
-      --platform "$PLATFORM" \
-      --ignition-file "$OUT_DIR/ignition.json"
-  fi
-else
-  log "installing FCOS to $loopdev via containerized coreos-installer (rootful podman)"
+  log "[2/3] installing FCOS via coreos-installer container"
+  log "[2/3] podman pull/run: quay.io/coreos/coreos-installer:release"
   podman run --pull=always --privileged --rm \
     --security-opt label=disable \
-    --device "$loopdev" \
     -v /dev:/dev \
     -v /run/udev:/run/udev \
     -v "$OUT_DIR":/data:z \
     quay.io/coreos/coreos-installer:release \
-    install "$loopdev" \
-      --stream "$STREAM" \
-      --architecture "$ARCH" \
-      --platform "$PLATFORM" \
-      --ignition-file /data/ignition.json
-fi
+    /bin/sh -c 'set -euo pipefail; \
+      echo "inside container: finding loop for /data/fcos-usb.img"; \
+      loop=$(losetup --find --show /data/fcos-usb.img); \
+      trap "losetup -d $loop" EXIT; \
+      echo "inside container: loop=$loop; running coreos-installer"; \
+      coreos-installer install "$loop" \
+        --stream '"$STREAM"' \
+        --architecture '"$ARCH"' \
+        --platform '"$PLATFORM"' \
+        --ignition-file /data/ignition.json; \
+      sync'
 
-  sudo_maybe sync
-  if [ -n "${loopdev:-}" ]; then
-    sudo_maybe losetup -d "$loopdev"
-    trap - RETURN
-  fi
-
-  log "wrote $img"
+  log "[3/3] image ready: $img_real"
 }
 
 run_qemu() {
@@ -372,8 +270,8 @@ run_qemu() {
     cmd+=(-- "${QEMU_EXTRA[@]}")
   fi
 
-  log "launching QEMU (image=$(basename "$img"), mem=${QEMU_MEM_MB}MB, cpus=$QEMU_CPUS, ssh_port=$QEMU_SSH_PORT)"
-  "${cmd[@]}"
+  log "[qemu] launching (image=$(basename "$img"), mem=${QEMU_MEM_MB}MB, cpus=$QEMU_CPUS, ssh_port=$QEMU_SSH_PORT)"
+  exec "${cmd[@]}"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -405,58 +303,39 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+[ "$(id -u)" -eq 0 ] || die "run this script with sudo (root required for losetup inside podman)"
+have podman || die "podman is required"
+
 if [ -z "$OUT_DIR" ]; then
   OUT_DIR="$PWD/out/fcos-usb-${USERNAME}"
 fi
-
 if ! [[ "$DISK_SIZE_GIB" =~ ^[0-9]+$ ]] || [ "$DISK_SIZE_GIB" -le 0 ]; then
   die "--size-gib must be a positive integer (got: $DISK_SIZE_GIB)"
 fi
-if ! [[ "$QEMU_MEM_MB" =~ ^[0-9]+$ ]] || [ "$QEMU_MEM_MB" -le 0 ]; then
-  die "--qemu-memory must be a positive integer (got: $QEMU_MEM_MB)"
-fi
-if ! [[ "$QEMU_CPUS" =~ ^[0-9]+$ ]] || [ "$QEMU_CPUS" -le 0 ]; then
-  die "--qemu-cpus must be a positive integer (got: $QEMU_CPUS)"
-fi
-if ! [[ "$QEMU_SSH_PORT" =~ ^[0-9]+$ ]] || [ "$QEMU_SSH_PORT" -lt 0 ]; then
-  die "--qemu-ssh-port must be a non-negative integer (got: $QEMU_SSH_PORT)"
-fi
-if [ "$RUN_QEMU" -eq 1 ] && [ "$DO_BUILD" -eq 0 ]; then
-  die "--run-qemu requires building the image; remove --no-build"
-fi
-
 if [ "$PROMPT_PASSWORD" -eq 1 ] && [ -z "$PASSWORD_HASH" ]; then
   prompt_password_hash
 fi
 
+log "[prep] output dir: $OUT_DIR"
 write_ignition
+log "[plan] build=$DO_BUILD run_qemu=$RUN_QEMU"
 
 if [ "$DO_BUILD" -eq 1 ]; then
-  build_raw_image
+  install_image
 
   cat <<EOF
 
-Next steps:
-  1) Write the image to a USB drive (DESTROYING its contents):
+Image ready:
+  $OUT_DIR/fcos-usb.img
 
-     sudo dd if="$OUT_DIR/fcos-usb.img" of=/dev/sdX bs=4M conv=fsync status=progress
+To write to USB (DESTROYS target):
+  sudo dd if="$OUT_DIR/fcos-usb.img" of=/dev/sdX bs=4M conv=fsync status=progress
 
-  2) Boot from the USB. On first boot it will clone:
-
-     $REPO_URL (ref: $REPO_REF)
-
-Troubleshooting:
-  - If cloning fails, verify networking and re-run:
-      sudo systemctl restart cloud-native-bootstrap.service
+First boot pulls:
+  $REPO_URL (ref: $REPO_REF)
 EOF
 else
-  cat <<EOF
-
-Ignition generated at:
-  $OUT_DIR/ignition.json
-
-To build a bootable USB image, install coreos-installer and re-run without --no-build.
-EOF
+  log "ignition only; skipping image build (--no-build set)"
 fi
 
 if [ "$RUN_QEMU" -eq 1 ]; then
